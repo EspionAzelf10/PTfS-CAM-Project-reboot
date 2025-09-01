@@ -4,7 +4,7 @@
 #ifdef LIKWID_PERFMON
     #include <likwid.h>
 #endif
-//hey hey hey
+//hey hey
 //default boundary function as in ex01
 double defaultBoundary(int i, int j, double h_x, double h_y)
 {
