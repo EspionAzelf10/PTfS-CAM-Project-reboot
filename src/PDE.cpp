@@ -1,10 +1,11 @@
 #include "PDE.h"
 #include <math.h>
 #include <iostream>
+#include <omp.h>
+
 #ifdef LIKWID_PERFMON
     #include <likwid.h>
 #endif
-//hey hey
 //default boundary function as in ex01
 double defaultBoundary(int i, int j, double h_x, double h_y)
 {
@@ -115,7 +116,7 @@ void PDE::applyStencil(Grid* lhs, Grid* x)
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("APPLY_STENCIL");
 #endif
-
+    #pragma omp parallel for collapse(2) schedule(static)
     for ( int j=1; j<ySize-1; ++j)
     {
         for ( int i=1; i<xSize-1; ++i)
