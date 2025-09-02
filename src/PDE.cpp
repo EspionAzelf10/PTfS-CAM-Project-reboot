@@ -154,9 +154,11 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
 #endif
 
     // fused forward + backward substitution
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int j=1; j<ySize-1; ++j) {
         for (int i=1; i<xSize-1; ++i) {
             // forward step
+            (*x)(j,i) = 0.0;   // initialize in parallel
             (*x)(j,i) = w_c * ((*rhs)(j,i) + w_y*(*x)(j-1,i) + w_x*(*x)(j,i-1));
 
             // backward correction (look-ahead if inside domain)
