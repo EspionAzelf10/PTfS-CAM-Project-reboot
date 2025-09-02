@@ -263,6 +263,7 @@ void axpby(Grid *lhs, double a, Grid *x, double b, Grid *y, bool halo)
     LIKWID_MARKER_START("AXPBY");
 #endif
 
+    #pragma omp parallel for collapse(2)
     for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex)
     {
         for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex)
@@ -291,7 +292,7 @@ void copy(Grid *lhs, double a, Grid *rhs, bool halo)
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("COPY");
 #endif
-
+    #pragma omp parallel for collapse(2)
     for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex)
     {
         for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex)
@@ -325,6 +326,7 @@ double dotProduct(Grid *x, Grid *y, bool halo)
 #endif
 
     double dot_res = 0;
+    #pragma omp parallel for collapse(2) reduction(+:dot_res)
     for(int yIndex=shift; yIndex<x->numGrids_y(true)-shift; ++yIndex)
     {
         for(int xIndex=shift; xIndex<x->numGrids_x(true)-shift; ++xIndex)
