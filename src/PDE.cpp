@@ -1,5 +1,4 @@
 //back to normal
-
 #include "PDE.h"
 #include <math.h>
 #include <iostream>
@@ -143,36 +142,39 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     assert((rhs->numGrids_y(true)==grids_y) && (rhs->numGrids_x(true)==grids_x));
     assert((x->numGrids_y(true)==grids_y) && (x->numGrids_x(true)==grids_x));
 #endif
-
     const int xSize = x->numGrids_x(true);
     const int ySize = x->numGrids_y(true);
 
+
     const double w_x = 1.0/(h_x*h_x);
     const double w_y = 1.0/(h_y*h_y);
-    const double w_c = 1.0/(2.0*w_x + 2.0*w_y);
+    const double w_c = 1.0/static_cast<double>((2.0*w_x + 2.0*w_y));
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("GS_PRE_CON");
 #endif
 
-    // fused forward + backward substitution
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int j=1; j<ySize-1; ++j) {
-        for (int i=1; i<xSize-1; ++i) {
-            // forward step
-            (*x)(j,i) = 0.0;   // initialize in parallel
-            (*x)(j,i) = w_c * ((*rhs)(j,i) + w_y*(*x)(j-1,i) + w_x*(*x)(j,i-1));
-
-            // backward correction (look-ahead if inside domain)
-            if (j < ySize-2 && i < xSize-2) {
-                (*x)(j,i) += w_c * (w_y*(*x)(j+1,i) + w_x*(*x)(j,i+1));
-            }
+    //forward substitution
+    for ( int j=1; j<ySize-1; ++j)
+    {
+        for ( int i=1; i<xSize-1; ++i)
+        {
+            (*x)(j,i) = w_c*((*rhs)(j,i) + (w_y*(*x)(j-1,i) + w_x*(*x)(j,i-1)));
+        }
+    }
+    //backward substitution
+    for ( int j=ySize-2; j>0; --j)
+    {
+        for ( int i=xSize-2; i>0; --i)
+        {
+            (*x)(j,i) = (*x)(j,i) + w_c*(w_y*(*x)(j+1,i) + w_x*(*x)(j,i+1));
         }
     }
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("GS_PRE_CON");
 #endif
+
 
     STOP_TIMER(GS_PRE_CON);
 }
