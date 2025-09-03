@@ -113,23 +113,41 @@ void PDE::applyStencil(Grid* lhs, Grid* x)
     const double w_y = 1.0/(h_y*h_y);
     const double w_c = 2.0*w_x + 2.0*w_y;
 
+    // Direct array access for better vectorization
+    double* __restrict__ lhsPtr = lhs->arrayPtr;
+    double* __restrict__ xPtr = x->arrayPtr;
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("APPLY_STENCIL");
 #endif
-    #pragma omp parallel for collapse(2) schedule(static)
-    for ( int j=1; j<ySize-1; ++j)
-    {
-        for ( int i=1; i<xSize-1; ++i)
-        {
-            (*lhs)(j,i) = w_c*(*x)(j,i) - w_y*((*x)(j+1,i) + (*x)(j-1,i)) - w_x*((*x)(j,i+1) + (*x)(j,i-1));
+
+    // Cache blocking for better locality
+    const int BLOCK_SIZE = 64;  // Adjusted for L1 cache size
+
+    #pragma omp parallel for collapse(2) schedule(static) proc_bind(close)
+    for(int jb = 1; jb < ySize-1; jb += BLOCK_SIZE) {
+        for(int ib = 1; ib < xSize-1; ib += BLOCK_SIZE) {
+            const int jmax = std::min(jb + BLOCK_SIZE, ySize-1);
+            const int imax = std::min(ib + BLOCK_SIZE, xSize-1);
+
+            for(int j = jb; j < jmax; ++j) {
+                const int row = j * xSize;
+                const int rowUp = (j-1) * xSize;
+                const int rowDown = (j+1) * xSize;
+
+                #pragma omp simd aligned(lhsPtr,xPtr:64)
+                for(int i = ib; i < imax; ++i) {
+                    lhsPtr[row + i] = w_c * xPtr[row + i] 
+                                   - w_y * (xPtr[rowDown + i] + xPtr[rowUp + i])
+                                   - w_x * (xPtr[row + i + 1] + xPtr[row + i - 1]);
+                }
+            }
         }
     }
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("APPLY_STENCIL");
 #endif
-
 
     STOP_TIMER(APPLY_STENCIL);
 }
@@ -145,36 +163,47 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     const int xSize = x->numGrids_x(true);
     const int ySize = x->numGrids_y(true);
 
-
     const double w_x = 1.0/(h_x*h_x);
     const double w_y = 1.0/(h_y*h_y);
-    const double w_c = 1.0/static_cast<double>((2.0*w_x + 2.0*w_y));
+    const double w_c = 1.0/(2.0*w_x + 2.0*w_y);
+
+    double* __restrict__ xPtr = x->arrayPtr;
+    const double* __restrict__ rhsPtr = rhs->arrayPtr;
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("GS_PRE_CON");
 #endif
 
-    //forward substitution
-    for ( int j=1; j<ySize-1; ++j)
-    {
-        for ( int i=1; i<xSize-1; ++i)
-        {
-            (*x)(j,i) = w_c*((*rhs)(j,i) + (w_y*(*x)(j-1,i) + w_x*(*x)(j,i-1)));
+    // Forward sweep - must remain sequential but can use SIMD within rows
+    for(int j = 1; j < ySize-1; ++j) {
+        const int row = j * xSize;
+        const int rowUp = (j-1) * xSize;
+
+        #pragma omp simd aligned(xPtr,rhsPtr:64)
+        for(int i = 1; i < xSize-1; ++i) {
+            const int idx = row + i;
+            xPtr[idx] = w_c * (rhsPtr[idx] + 
+                              w_y * xPtr[rowUp + i] + 
+                              w_x * xPtr[idx - 1]);
         }
     }
-    //backward substitution
-    for ( int j=ySize-2; j>0; --j)
-    {
-        for ( int i=xSize-2; i>0; --i)
-        {
-            (*x)(j,i) = (*x)(j,i) + w_c*(w_y*(*x)(j+1,i) + w_x*(*x)(j,i+1));
+
+    // Backward sweep
+    for(int j = ySize-2; j > 0; --j) {
+        const int row = j * xSize;
+        const int rowDown = (j+1) * xSize;
+
+        #pragma omp simd aligned(xPtr:64)
+        for(int i = xSize-2; i > 0; --i) {
+            const int idx = row + i;
+            xPtr[idx] += w_c * (w_y * xPtr[rowDown + i] + 
+                               w_x * xPtr[idx + 1]);
         }
     }
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("GS_PRE_CON");
 #endif
-
 
     STOP_TIMER(GS_PRE_CON);
 }
