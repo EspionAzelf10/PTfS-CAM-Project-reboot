@@ -263,12 +263,11 @@ void axpby(Grid *lhs, double a, Grid *x, double b, Grid *y, bool halo)
     LIKWID_MARKER_START("AXPBY");
 #endif
 
-    #pragma omp parallel for collapse(2)
-    for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex)
-    {
-        for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex)
-        {
-            (*lhs)(yIndex,xIndex) = (a*(*x)(yIndex,xIndex)) + (b*(*y)(yIndex,xIndex));
+    #pragma omp parallel for
+    for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex) {
+        #pragma omp simd
+        for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex) {
+           (*lhs)(yIndex,xIndex) = (a*(*x)(yIndex,xIndex)) + (b*(*y)(yIndex,xIndex));
         }
     }
 #ifdef LIKWID_PERFMON
@@ -292,11 +291,10 @@ void copy(Grid *lhs, double a, Grid *rhs, bool halo)
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("COPY");
 #endif
-    #pragma omp parallel for collapse(2)
-    for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex)
-    {
-        for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex)
-        {
+    #pragma omp parallel for
+    for(int yIndex=shift; yIndex<lhs->numGrids_y(true)-shift; ++yIndex) {
+        #pragma omp simd
+        for(int xIndex=shift; xIndex<lhs->numGrids_x(true)-shift; ++xIndex) {
             (*lhs)(yIndex,xIndex) = a*(*rhs)(yIndex,xIndex);
         }
     }
@@ -305,10 +303,9 @@ void copy(Grid *lhs, double a, Grid *rhs, bool halo)
     LIKWID_MARKER_STOP("COPY");
 #endif
 
-
     STOP_TIMER(COPY);
 }
-
+ 
 
 //Calculate dot product of x and y
 //i.e. ; res = x'*y
@@ -326,14 +323,13 @@ double dotProduct(Grid *x, Grid *y, bool halo)
 #endif
 
     double dot_res = 0;
-    #pragma omp parallel for collapse(2) reduction(+:dot_res)
-    for(int yIndex=shift; yIndex<x->numGrids_y(true)-shift; ++yIndex)
-    {
-        for(int xIndex=shift; xIndex<x->numGrids_x(true)-shift; ++xIndex)
-        {
-            dot_res += (*x)(yIndex,xIndex)*(*y)(yIndex,xIndex);
-        }
+    #pragma omp parallel for reduction(+:dot_res)
+    for(int yIndex=shift; yIndex<x->numGrids_y(true)-shift; ++yIndex) {
+       #pragma omp simd reduction(+:dot_res)
+       for(int xIndex=shift; xIndex<x->numGrids_x(true)-shift; ++xIndex) {
+           dot_res += (*x)(yIndex,xIndex)*(*y)(yIndex,xIndex);
     }
+}        
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("DOT_PRODUCT");
