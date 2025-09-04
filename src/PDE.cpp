@@ -98,6 +98,7 @@ void PDE::refreshBoundary(Grid *u)
 
 //Applies stencil operation on to x
 //i.e., lhs = A*x
+// inside PDE.cpp (replace existing PDE::applyStencil implementation)
 void PDE::applyStencil(Grid* lhs, Grid* x)
 {
     START_TIMER(APPLY_STENCIL);
@@ -106,33 +107,74 @@ void PDE::applyStencil(Grid* lhs, Grid* x)
     assert((lhs->numGrids_y(true)==grids_y) && (lhs->numGrids_x(true)==grids_x));
     assert((x->numGrids_y(true)==grids_y) && (x->numGrids_x(true)==grids_x));
 #endif
+
     const int xSize = numGrids_x(true);
     const int ySize = numGrids_y(true);
 
+    // weights for 5-point finite-difference Laplacian / Poisson-like operator
     const double w_x = 1.0/(h_x*h_x);
     const double w_y = 1.0/(h_y*h_y);
     const double w_c = 2.0*w_x + 2.0*w_y;
 
-
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("APPLY_STENCIL");
 #endif
-    #pragma omp parallel for collapse(2) schedule(static)
-    for ( int j=1; j<ySize-1; ++j)
+
+    // Tunable blocking parameter (rows per block). Adjust to your cache.
+#ifndef STENCIL_BLOCK_Y
+    const int BLOCK_Y = 32;
+#else
+    const int BLOCK_Y = STENCIL_BLOCK_Y;
+#endif
+
+    // Raw pointers for faster indexing (same layout used elsewhere)
+    double * __restrict__ lhsPtr = lhs->arrayPtr;
+    double * __restrict__ xPtr   = x->arrayPtr;
+
+    // We keep the same loop bounds as your original code: 1 .. size-2
+    const int y_start = 1;
+    const int y_end   = ySize - 1; // exclusive upper bound in blocked loop logic below
+    const int x_start = 1;
+    const int x_end   = xSize - 1;
+
+    // Parallelize across row-blocks. Each thread works on whole inner x ranges
+    #pragma omp parallel
     {
-        for ( int i=1; i<xSize-1; ++i)
-        {
-            (*lhs)(j,i) = w_c*(*x)(j,i) - w_y*((*x)(j+1,i) + (*x)(j-1,i)) - w_x*((*x)(j,i+1) + (*x)(j,i-1));
+        // Each thread executes chunks of blocks
+        #pragma omp for schedule(static)
+        for (int by = y_start; by < y_end; by += BLOCK_Y) {
+            int by_max = by + BLOCK_Y;
+            if (by_max > y_end) by_max = y_end;
+
+            // Process rows in the block
+            for (int j = by; j < by_max; ++j) {
+                int base = j * xSize;
+
+                // Inner loop — vectorizeable
+                #pragma omp simd
+                for (int i = x_start; i < x_end; ++i) {
+                    int idx = base + i;
+                    // neighbor indices (linear)
+                    // x(j,i)     -> xPtr[idx]
+                    // x(j+1,i)   -> xPtr[idx + xSize]
+                    // x(j-1,i)   -> xPtr[idx - xSize]
+                    // x(j,i+1)   -> xPtr[idx + 1]
+                    // x(j,i-1)   -> xPtr[idx - 1]
+                    lhsPtr[idx] = w_c * xPtr[idx]
+                                - w_y * (xPtr[idx + xSize] + xPtr[idx - xSize])
+                                - w_x * (xPtr[idx + 1]     + xPtr[idx - 1]);
+                }
+            }
         }
-    }
+    } // end parallel
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("APPLY_STENCIL");
 #endif
 
-
     STOP_TIMER(APPLY_STENCIL);
 }
+
 
 void PDE::GSPreCon(Grid* rhs, Grid *x)
 {

@@ -1,10 +1,14 @@
-// Solver.cpp - simple loop fusion only (no kernel fusion)
+// Solver.cpp - with SIMD, FMA, cache blocking, and correct OpenMP usage
 #include "Solver.h"
 #include "Grid.h"
 #include <cmath>
 #include <omp.h>
 
 #define IS_VALID(a) (!(std::isnan(a) || std::isinf(a)))
+
+// Cache blocking parameters (tunable)
+#define BLOCK_Y 32
+#define BLOCK_X 64
 
 SolverClass::SolverClass(PDE *pde_, Grid *x_, Grid *b_) : pde(pde_), x(x_), b(b_) {}
 
@@ -20,25 +24,28 @@ int SolverClass::CG(int niter, double tol)
     double lambda = 0.0;
     double alpha_0 = 0.0, alpha_1 = 0.0;
 
-    // Calculate residual
-    // p = A*x (stencil)
+    // Calculate residual: p = b - A*x
     pde->applyStencil(p, x);
 
-    // Fuse: p = b - p  (axpby)  AND alpha_0 = dot(p,p)
     {
         const int xSize = p->numGrids_x(true);
         const int ySize = p->numGrids_y(true);
-        const int shift = HALO; // same convention as other kernels (halo omitted)
+        const int shift = HALO;
         const int start = shift * xSize;
         const int end = (ySize - shift) * xSize;
 
         double sum = 0.0;
-        // Parallel fused loop: write p and accumulate norm
-        #pragma omp parallel for reduction(+:sum)
-        for (int idx = start; idx < end; ++idx) {
-            double val = (*b).arrayPtr[idx] - p->arrayPtr[idx];  // b - A*x
-            p->arrayPtr[idx] = val;
-            sum += val * val;
+        #pragma omp parallel reduction(+:sum)
+        {
+            double * __restrict__ pptr = p->arrayPtr;
+            double * __restrict__ bptr = b->arrayPtr;
+
+            #pragma omp for schedule(static)
+            for (int idx = start; idx < end; ++idx) {
+                double val = bptr[idx] - pptr[idx];
+                pptr[idx] = val;
+                sum = std::fma(val, val, sum);
+            }
         }
         alpha_0 = sum;
     }
@@ -52,31 +59,45 @@ int SolverClass::CG(int niter, double tol)
         // v = A * p
         pde->applyStencil(v, p);
 
-        // denom = <v, p>
         double denom = dotProduct(v, p);
         lambda = alpha_0 / denom;
 
-        // x = x + lambda * p (keep kernel)
+        // x = x + lambda * p
         axpby(x, 1.0, x, lambda, p);
 
-        // ---- Simple loop fusion: update r and compute alpha_1 = dot(r,r) in one pass ----
+        // ---- r update + norm (loop fusion) ----
         {
             const int xSize = r->numGrids_x(true);
             const int ySize = r->numGrids_y(true);
             const int shift = HALO;
-            const int start = shift * xSize;
-            const int end = (ySize - shift) * xSize;
+            const int x_start = shift, x_end = xSize - shift;
+            const int y_start = shift, y_end = ySize - shift;
 
-            double sum = 0.0;
-            #pragma omp parallel for reduction(+:sum)
-            for (int idx = start; idx < end; ++idx) {
-                double rv = r->arrayPtr[idx] - lambda * v->arrayPtr[idx]; // r = r - lambda*v
-                r->arrayPtr[idx] = rv;
-                sum += rv * rv;
+            double global_sum = 0.0;
+            #pragma omp parallel reduction(+:global_sum)
+            {
+                double * __restrict__ rptr = r->arrayPtr;
+                double * __restrict__ vptr = v->arrayPtr;
+
+                #pragma omp for schedule(static)
+                for (int by = y_start; by < y_end; by += BLOCK_Y) {
+                    int by_max = (by + BLOCK_Y > y_end) ? y_end : by + BLOCK_Y;
+
+                    for (int row = by; row < by_max; ++row) {
+                        int base = row * xSize;
+                        #pragma omp simd reduction(+:global_sum)
+                        for (int ix = x_start; ix < x_end; ++ix) {
+                            int idx = base + ix;
+                            double rv = rptr[idx] - lambda * vptr[idx];
+                            rptr[idx] = rv;
+                            global_sum = std::fma(rv, rv, global_sum);
+                        }
+                    }
+                }
             }
-            alpha_1 = sum;
+            alpha_1 = global_sum;
         }
-        // ------------------------------------------------------------------------------------
+        // ---------------------------------------
 
         // p = r + (alpha_1/alpha_0) * p
         axpby(p, 1.0, r, alpha_1 / alpha_0, p);
@@ -116,10 +137,9 @@ int SolverClass::PCG(int niter, double tol)
     double alpha_0 = 0.0, alpha_1 = 0.0;
     double res_norm_sq = 0.0;
 
-    // Initial residual: r = A*x
+    // r = b - A*x
     pde->applyStencil(r, x);
 
-    // Fuse: r = b - r  (axpby) AND res_norm_sq = dot(r,r)
     {
         const int xSize = r->numGrids_x(true);
         const int ySize = r->numGrids_y(true);
@@ -128,16 +148,21 @@ int SolverClass::PCG(int niter, double tol)
         const int end = (ySize - shift) * xSize;
 
         double sum = 0.0;
-        #pragma omp parallel for reduction(+:sum)
-        for (int idx = start; idx < end; ++idx) {
-            double rv = b->arrayPtr[idx] - r->arrayPtr[idx];
-            r->arrayPtr[idx] = rv;
-            sum += rv * rv;
+        #pragma omp parallel reduction(+:sum)
+        {
+            double * __restrict__ rptr = r->arrayPtr;
+            double * __restrict__ bptr = b->arrayPtr;
+
+            #pragma omp for schedule(static)
+            for (int idx = start; idx < end; ++idx) {
+                double rv = bptr[idx] - rptr[idx];
+                rptr[idx] = rv;
+                sum = std::fma(rv, rv, sum);
+            }
         }
         res_norm_sq = sum;
     }
 
-    // Preconditioner z = M^{-1} r
     pde->GSPreCon(r, z);
 
     alpha_0 = dotProduct(r, z);
@@ -150,36 +175,48 @@ int SolverClass::PCG(int niter, double tol)
         // v = A * p
         pde->applyStencil(v, p);
 
-        // denom = <v, p>
         double denom = dotProduct(v, p);
         lambda = alpha_0 / denom;
 
         // x = x + lambda * p
         axpby(x, 1.0, x, lambda, p);
 
-        // ---- Simple loop fusion: r = r - lambda*v  and compute res_norm_sq = dot(r,r) ----
+        // ---- r update + norm (loop fusion) ----
         {
             const int xSize = r->numGrids_x(true);
             const int ySize = r->numGrids_y(true);
             const int shift = HALO;
-            const int start = shift * xSize;
-            const int end = (ySize - shift) * xSize;
+            const int x_start = shift, x_end = xSize - shift;
+            const int y_start = shift, y_end = ySize - shift;
 
-            double sum = 0.0;
-            #pragma omp parallel for reduction(+:sum)
-            for (int idx = start; idx < end; ++idx) {
-                double rv = r->arrayPtr[idx] - lambda * v->arrayPtr[idx];
-                r->arrayPtr[idx] = rv;
-                sum += rv * rv;
+            double global_sum = 0.0;
+            #pragma omp parallel reduction(+:global_sum)
+            {
+                double * __restrict__ rptr = r->arrayPtr;
+                double * __restrict__ vptr = v->arrayPtr;
+
+                #pragma omp for schedule(static)
+                for (int by = y_start; by < y_end; by += BLOCK_Y) {
+                    int by_max = (by + BLOCK_Y > y_end) ? y_end : by + BLOCK_Y;
+
+                    for (int row = by; row < by_max; ++row) {
+                        int base = row * xSize;
+                        #pragma omp simd reduction(+:global_sum)
+                        for (int ix = x_start; ix < x_end; ++ix) {
+                            int idx = base + ix;
+                            double rv = rptr[idx] - lambda * vptr[idx];
+                            rptr[idx] = rv;
+                            global_sum = std::fma(rv, rv, global_sum);
+                        }
+                    }
+                }
             }
-            res_norm_sq = sum;
+            res_norm_sq = global_sum;
         }
-        // ------------------------------------------------------------------------------------
+        // ---------------------------------------
 
-        // z = M^{-1} r
         pde->GSPreCon(r, z);
 
-        // alpha_1 = <r, z>
         alpha_1 = dotProduct(r, z);
 
         // p = z + (alpha_1/alpha_0) * p
