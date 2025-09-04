@@ -139,58 +139,92 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     START_TIMER(GS_PRE_CON);
 
 #ifdef DEBUG
-    assert((rhs->numGrids_y(true)==grids_y) && (rhs->numGrids_x(true)==grids_x));
-    assert((x->numGrids_y(true)==grids_y) && (x->numGrids_x(true)==grids_x));
+    assert((rhs->numGrids_y(true) == grids_y) && (rhs->numGrids_x(true) == grids_x));
+    assert((x->numGrids_y(true)   == grids_y) && (x->numGrids_x(true)   == grids_x));
 #endif
+
     const int xSize = x->numGrids_x(true);
     const int ySize = x->numGrids_y(true);
 
     const double w_x = 1.0/(h_x*h_x);
     const double w_y = 1.0/(h_y*h_y);
+    // note: this matches your previous code: multiply by w_c
     const double w_c = 1.0/static_cast<double>((2.0*w_x + 2.0*w_y));
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("GS_PRE_CON");
 #endif
 
-    // Raw pointers to contiguous storage (fewer indirections)
+    // Raw contiguous pointers for performance
     double * __restrict__ xPtr   = x->arrayPtr;
     double * __restrict__ rhsPtr = rhs->arrayPtr;
 
-    // Forward substitution (lexicographic)
-    for (int j = 1; j < ySize - 1; ++j) {
-        double * __restrict__ row    = xPtr + j * xSize;
-        double * __restrict__ row_m  = xPtr + (j - 1) * xSize;
-        double * __restrict__ rhsRow = rhsPtr + j * xSize;
+    // s = i + j runs from 2 .. (xSize-2)+(ySize-2)
+    const int sStart = 2;
+    const int sEnd   = (xSize - 2) + (ySize - 2);
 
-        // portable software prefetch of next row (help memory throughput)
-        // (use locality 3, read-prefetch)
-        __builtin_prefetch((const void*)(rhsPtr + (j + 1) * xSize), 0, 3);
-        __builtin_prefetch((const void*)(xPtr   + (j + 1) * xSize), 0, 3);
+    // Single parallel region to avoid repeated fork/join
+    #pragma omp parallel
+    {
+        // Forward substitution: process anti-diagonals with increasing s
+        for (int s = sStart; s <= sEnd; ++s) {
 
-        // dependency along i (row[i] depends on row[i-1]) prevents vectorizing across i
-        for (int i = 1; i < xSize - 1; ++i) {
-            // row[i] = w_c * ( rhsRow[i] + w_y*row_m[i] + w_x*row[i-1] )
-            const double north = w_y * row_m[i];    // previous row value
-            const double west  = w_x * row[i - 1];  // left neighbour in same row
-            row[i] = w_c * (rhsRow[i] + north + west);
-        }
-    }
+            // compute i bounds for this diagonal:
+            // i in [ max(1, s-(ySize-2)) , min(xSize-2, s-1) ]
+            int i_low  = s - (ySize - 2);
+            if (i_low < 1) i_low = 1;
+            int i_high = s - 1;
+            if (i_high > (xSize - 2)) i_high = (xSize - 2);
 
-    // Backward substitution (reverse lexicographic)
-    for (int j = ySize - 2; j > 0; --j) {
-        double * __restrict__ row   = xPtr + j * xSize;
-        double * __restrict__ row_p = xPtr + (j + 1) * xSize;
+            // Worksharing across i on this diagonal
+            #pragma omp for schedule(static)
+            for (int i = i_low; i <= i_high; ++i) {
+                int j = s - i;              // 1 <= j <= ySize-2 guaranteed by bounds
+                int idx = j * xSize + i;
 
-        // prefetch previous row (used soon)
-        __builtin_prefetch((const void*)(xPtr + (j - 1) * xSize), 0, 3);
+                // neighbors indices:
+                // north: (j-1,i) -> idx - xSize
+                // west : (j, i-1) -> idx - 1
 
-        for (int i = xSize - 2; i > 0; --i) {
-            // row[i] += w_c * ( w_y*row_p[i] + w_x*row[i+1] )
-            const double t = w_y * row_p[i] + w_x * row[i + 1];
-            row[i] = row[i] + w_c * t;
-        }
-    }
+                // compute update exactly as original lexicographic forward:
+                const double north_term = w_y * xPtr[idx - xSize];
+                const double west_term  = w_x * xPtr[idx - 1];
+                const double r = rhsPtr[idx];
+
+                xPtr[idx] = w_c * (r + north_term + west_term);
+            }
+
+            // ensure entire diagonal completed before moving to the next one
+            #pragma omp barrier
+        } // end forward wavefront loop
+
+        // small sync (ensure everyone finished forward pass)
+        #pragma omp barrier
+
+        // Backward substitution: process anti-diagonals in decreasing s
+        for (int s = sEnd; s >= sStart; --s) {
+
+            int i_low  = s - (ySize - 2);
+            if (i_low < 1) i_low = 1;
+            int i_high = s - 1;
+            if (i_high > (xSize - 2)) i_high = (xSize - 2);
+
+            #pragma omp for schedule(static)
+            for (int i = i_low; i <= i_high; ++i) {
+                int j = s - i;
+                int idx = j * xSize + i;
+
+                // neighbors used in backward step:
+                // south: (j+1,i) -> idx + xSize
+                // east : (j,i+1) -> idx + 1
+
+                const double t = w_y * xPtr[idx + xSize] + w_x * xPtr[idx + 1];
+                xPtr[idx] = xPtr[idx] + w_c * t;
+            }
+
+            #pragma omp barrier
+        } // end backward wavefront loop
+    } // end parallel region
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("GS_PRE_CON");
