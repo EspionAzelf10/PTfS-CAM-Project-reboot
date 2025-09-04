@@ -145,7 +145,6 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     const int xSize = x->numGrids_x(true);
     const int ySize = x->numGrids_y(true);
 
-
     const double w_x = 1.0/(h_x*h_x);
     const double w_y = 1.0/(h_y*h_y);
     const double w_c = 1.0/static_cast<double>((2.0*w_x + 2.0*w_y));
@@ -154,20 +153,42 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     LIKWID_MARKER_START("GS_PRE_CON");
 #endif
 
-    //forward substitution
-    for ( int j=1; j<ySize-1; ++j)
-    {
-        for ( int i=1; i<xSize-1; ++i)
-        {
-            (*x)(j,i) = w_c*((*rhs)(j,i) + (w_y*(*x)(j-1,i) + w_x*(*x)(j,i-1)));
+    // Raw pointers to contiguous storage (fewer indirections)
+    double * __restrict__ xPtr   = x->arrayPtr;
+    double * __restrict__ rhsPtr = rhs->arrayPtr;
+
+    // Forward substitution (lexicographic)
+    for (int j = 1; j < ySize - 1; ++j) {
+        double * __restrict__ row    = xPtr + j * xSize;
+        double * __restrict__ row_m  = xPtr + (j - 1) * xSize;
+        double * __restrict__ rhsRow = rhsPtr + j * xSize;
+
+        // portable software prefetch of next row (help memory throughput)
+        // (use locality 3, read-prefetch)
+        __builtin_prefetch((const void*)(rhsPtr + (j + 1) * xSize), 0, 3);
+        __builtin_prefetch((const void*)(xPtr   + (j + 1) * xSize), 0, 3);
+
+        // dependency along i (row[i] depends on row[i-1]) prevents vectorizing across i
+        for (int i = 1; i < xSize - 1; ++i) {
+            // row[i] = w_c * ( rhsRow[i] + w_y*row_m[i] + w_x*row[i-1] )
+            const double north = w_y * row_m[i];    // previous row value
+            const double west  = w_x * row[i - 1];  // left neighbour in same row
+            row[i] = w_c * (rhsRow[i] + north + west);
         }
     }
-    //backward substitution
-    for ( int j=ySize-2; j>0; --j)
-    {
-        for ( int i=xSize-2; i>0; --i)
-        {
-            (*x)(j,i) = (*x)(j,i) + w_c*(w_y*(*x)(j+1,i) + w_x*(*x)(j,i+1));
+
+    // Backward substitution (reverse lexicographic)
+    for (int j = ySize - 2; j > 0; --j) {
+        double * __restrict__ row   = xPtr + j * xSize;
+        double * __restrict__ row_p = xPtr + (j + 1) * xSize;
+
+        // prefetch previous row (used soon)
+        __builtin_prefetch((const void*)(xPtr + (j - 1) * xSize), 0, 3);
+
+        for (int i = xSize - 2; i > 0; --i) {
+            // row[i] += w_c * ( w_y*row_p[i] + w_x*row[i+1] )
+            const double t = w_y * row_p[i] + w_x * row[i + 1];
+            row[i] = row[i] + w_c * t;
         }
     }
 
@@ -175,9 +196,10 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     LIKWID_MARKER_STOP("GS_PRE_CON");
 #endif
 
-
     STOP_TIMER(GS_PRE_CON);
 }
+
+
 
 int PDE::solve(Grid *x, Grid *b, Solver type, int niter, double tol)
 {
