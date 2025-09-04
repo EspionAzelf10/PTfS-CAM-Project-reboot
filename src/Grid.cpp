@@ -309,36 +309,36 @@ void copy(Grid *lhs, double a, Grid *rhs, bool halo)
 
 //Calculate dot product of x and y
 //i.e. ; res = x'*y
-double dotProduct(Grid *x, Grid *y, bool halo)
+double dotProduct(Grid* __restrict__ x, Grid* __restrict__ y, bool halo)
 {
     START_TIMER(DOT_PRODUCT);
 #ifdef DEBUG
     assert((y->numGrids_y(true)==x->numGrids_y(true)) && (y->numGrids_x(true)==x->numGrids_x(true)));
 #endif
 
-    int shift = halo?0:HALO;
+    const int xSize = x->numGrids_x(true);
+    const int ySize = x->numGrids_y(true);
+    const int shift = halo ? 0 : HALO;
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_START("DOT_PRODUCT");
 #endif
 
-    double dot_res = 0;
+    double dot_res = 0.0;
+
     #pragma omp parallel for reduction(+:dot_res)
-    for(int yIndex=shift; yIndex<x->numGrids_y(true)-shift; ++yIndex) {
-       #pragma omp simd reduction(+:dot_res)
-       for(int xIndex=shift; xIndex<x->numGrids_x(true)-shift; ++xIndex) {
-           dot_res += (*x)(yIndex,xIndex)*(*y)(yIndex,xIndex);
+    for (int idx = shift * xSize; idx < (ySize - shift) * xSize; ++idx) {
+        dot_res = std::fma(x->arrayPtr[idx], y->arrayPtr[idx], dot_res);
     }
-}        
 
 #ifdef LIKWID_PERFMON
     LIKWID_MARKER_STOP("DOT_PRODUCT");
 #endif
 
-
     STOP_TIMER(DOT_PRODUCT);
     return dot_res;
 }
+
 
 
 bool isSymmetric(Grid *u, double tol, bool halo)
