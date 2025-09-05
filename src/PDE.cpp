@@ -196,8 +196,8 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
     LIKWID_MARKER_START("GS_PRE_CON");
 #endif
 
-    double * __restrict__ xPtr   = x->arrayPtr;
-    double * __restrict__ rhsPtr = rhs->arrayPtr;
+    double* __restrict__ xPtr = x->arrayPtr;
+    double* __restrict__ rhsPtr = rhs->arrayPtr;
 
     const int sStart = 2;
     const int sEnd   = (xSize - 2) + (ySize - 2);
@@ -214,10 +214,14 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
                 int j = s - i;
                 int idx = j * xSize + i;
 
-                // Compute using fused multiply-add for vectorization
-                xPtr[idx] = w_c * (rhsPtr[idx] +
-                                    w_y * xPtr[idx - xSize] +
-                                    w_x * xPtr[idx - 1]);
+                // Prefetch next row data for cache
+                __builtin_prefetch(xPtr + idx + xSize, 0, 3);
+                __builtin_prefetch(rhsPtr + idx + xSize, 0, 3);
+
+                // SIMD vectorize this loop in caller with #pragma omp simd
+                xPtr[idx] = w_c * (rhsPtr[idx]
+                                 + w_y * xPtr[idx - xSize]
+                                 + w_x * xPtr[idx - 1]);
             }
         }
 
@@ -233,8 +237,10 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
                 int j = s - i;
                 int idx = j * xSize + i;
 
-                xPtr[idx] += w_c * (w_y * xPtr[idx + xSize] +
-                                    w_x * xPtr[idx + 1]);
+                __builtin_prefetch(xPtr + idx - xSize, 0, 3);
+
+                xPtr[idx] += w_c * (w_y * xPtr[idx + xSize]
+                                  + w_x * xPtr[idx + 1]);
             }
         }
     }
@@ -245,6 +251,7 @@ void PDE::GSPreCon(Grid* rhs, Grid *x)
 
     STOP_TIMER(GS_PRE_CON);
 }
+
 
 
 
